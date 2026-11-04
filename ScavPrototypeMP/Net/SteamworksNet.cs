@@ -144,7 +144,6 @@ public class KSteam : MonoBehaviour {
 
 
     internal static void LeaveLobbyAndResetNet(CSteamID lobby_steamID) {
-        IS_DOING_HostLobbyRecreatorLoop = false;
         CURRENT_LOBBY.lobby_steamID = lobby_steamID;
         LeaveLobbyAndResetNet(true);
     }
@@ -278,28 +277,64 @@ public class KSteam : MonoBehaviour {
     }
 
     static bool IS_DOING_HostLobbyRecreatorLoop = false;
+    static bool hostLostSteamConnection;
+
+    internal static void CancelHostLobbyRecovery() {
+        if (IS_DOING_HostLobbyRecreatorLoop)
+            OnLobbyCreatedCallResult.Cancel(); // so a late answer doesnt reopen the lobby after we left
+        IS_DOING_HostLobbyRecreatorLoop = false;
+        hostLostSteamConnection = false;
+    }
+
+    static void BeginHostLobbyRecovery(TransportSteamworks tsteam) {
+        if (IS_DOING_HostLobbyRecreatorLoop)
+            return;
+        IS_DOING_HostLobbyRecreatorLoop = true;
+        var oldLobby = CURRENT_LOBBY.lobby_steamID;
+        CURRENT_LOBBY.lobby_steamID = CSteamID.Nil;
+        CURRENT_LOBBY.members.Clear();
+        IS_IN_LOBBY = false;
+        tsteam.ShutdownForLobbyRecovery(); // the old clients cant reach us anymore, drop them with the sockets
+        if (oldLobby != CSteamID.Nil)
+            SteamMatchmaking.LeaveLobby(oldLobby);
+        Util.StartCoroutine(HostLobbyRecreatorLoop);
+    }
+
     static IEnumerator HostLobbyRecreatorLoop() {
-        var start = Time.realtimeSinceStartupAsDouble;
-        while (IS_IN_LOBBY && Net.TryGetSteamTransport(out var tsteam) && CURRENT_LOBBY.lobby_steamID == CSteamID.Nil) {
-            yield return null;
-
-            if ((Time.realtimeSinceStartupAsDouble - start) > 2) {
-                start = Time.realtimeSinceStartupAsDouble;
-
-                IS_DOING_HostLobbyRecreatorLoop = true;
-
-                tsteam.CreateLobby(KSteam.NumToLobbyType(UIMainMenu._STEAM_CHOSEN_LOBBYTYPE));
-
-                yield return new WaitForSeconds(1);
-            }
+        if (!Net.TryGetSteamTransport(out var tsteam)) {
+            IS_DOING_HostLobbyRecreatorLoop = false;
+            yield break;
         }
+        while (IS_DOING_HostLobbyRecreatorLoop && Net.IsServer && ReferenceEquals(Net.Transport, tsteam)) {
+            // wait for steam to come back, and dont stack attempts while one is still pending
+            if (SteamUser.BLoggedOn() && !OnLobbyCreatedCallResult.IsActive())
+                tsteam.CreateLobby(NumToLobbyType(UIMainMenu._STEAM_CHOSEN_LOBBYTYPE));
+            yield return new WaitForSecondsRealtime(2);
+        }
+        if (ReferenceEquals(Net.Transport, tsteam)) // otherwise Shutdown already reset it, and it may belong to a newer recovery
+            IS_DOING_HostLobbyRecreatorLoop = false;
     }
 
 
     void Update10s() {
 
         if (Net.IsRunningSteam && Net.IsServer) {
-            Server_UpdateLobbyData();
+            bool disconnected = !SteamUser.BLoggedOn();
+            bool reconnected = hostLostSteamConnection && !disconnected;
+            if (disconnected != hostLostSteamConnection) {
+                hostLostSteamConnection = disconnected;
+                Chat.LogMessage(Chat.NAMELABEL_LOCALSYSTEM, disconnected ? "Connection to Steam lost." : "Reconnected to Steam.");
+            }
+            // owner is Nil once steam drops us. wait a tick after reconnecting so the lobby can resync,
+            // and skip lobbies that OnLobbyEnter hasnt set up yet (no socket)
+            if (!IS_DOING_HostLobbyRecreatorLoop && IS_IN_LOBBY && !disconnected && !reconnected
+                && Net.TryGetSteamTransport(out var tsteam)
+                && (LobbyId == CSteamID.Nil
+                    || (tsteam.listenSocket != HSteamListenSocket.Invalid
+                        && SteamMatchmaking.GetLobbyOwner(LobbyId) != GetLocalUserSteamID())))
+                BeginHostLobbyRecovery(tsteam);
+            if (IS_IN_LOBBY && !disconnected)
+                Server_UpdateLobbyData();
         }
 
         UpdateRichPresence();
@@ -1018,6 +1053,9 @@ public class KSteam : MonoBehaviour {
 
             return;
         }
+        // recovery sets up its socket in OnLobbyCreated, and a lobby with a socket is already set up
+        if (Net.IsServer && (IS_DOING_HostLobbyRecreatorLoop || tsteam.listenSocket != HSteamListenSocket.Invalid))
+            return;
         if (enterresponse != EChatRoomEnterResponse.k_EChatRoomEnterResponseSuccess) {
             var msg = enterresponse.ToString();
             msg = msg.TrimStart("k_EChatRoomEnterResponse");
@@ -1135,6 +1173,8 @@ public class KSteam : MonoBehaviour {
     }
 
     static void OnLobbyDataUpdate(LobbyDataUpdate_t pCallback) {
+        if (Net.IsRunningSteam && Net.IsServer && CURRENT_LOBBY.lobby_steamID.m_SteamID != pCallback.m_ulSteamIDLobby)
+            return; // dont let the old lobby overwrite the recovered one
 
 #if false  // not necessary to log this
         if (pCallback.m_ulSteamIDLobby == pCallback.m_ulSteamIDMember) {
@@ -1161,6 +1201,9 @@ public class KSteam : MonoBehaviour {
                 steamtestlog("[" + LobbyChatUpdate_t.k_iCallback + " - LobbyChatUpdate] - " + pCallback.m_ulSteamIDLobby + " -- " + TransportSteamworks.BetterToStringFromSteamID(pCallback.m_ulSteamIDUserChanged) + " -- " + pCallback.m_ulSteamIDMakingChange + " -- " + stateChange,true);
             }
 
+            // ignore updates from lobbies abandoned during recovery
+            if (Net.IsRunningSteam && Net.IsServer && CURRENT_LOBBY.lobby_steamID.m_SteamID != pCallback.m_ulSteamIDLobby)
+                return;
             if (IS_IN_LOBBY && Net.TryGetSteamTransport(out var tsteam)) {
             } else {
                 if (Multiplayer.verbose)
@@ -1212,9 +1255,7 @@ public class KSteam : MonoBehaviour {
                 if (isLocalUser && tsteam.i_am_owner_of_this_lobby) {
                     Multiplayer.DoMultiplayerStatusMessageLog($"I got removed from the lobby. But im the owner!\nAttempting to recreate lobby in a sec...");
 
-                    CURRENT_LOBBY.lobby_steamID = CSteamID.Nil;
-                    tsteam.Shutdown(false); // clean up the sockets
-                    Util.StartCoroutine(HostLobbyRecreatorLoop);
+                    BeginHostLobbyRecovery(tsteam);
                     
                     return;
                 }
@@ -1378,6 +1419,27 @@ public class KSteam : MonoBehaviour {
     static void OnLobbyCreated(LobbyCreated_t pCallback, bool bIOFailure) {
         steamtestlog("[" + LobbyCreated_t.k_iCallback + " - LobbyCreated] - " + pCallback.m_eResult + " -- " + pCallback.m_ulSteamIDLobby);
 
+        // the game is still running, so only reopen the lobby and the socket. failed attempts get retried by HostLobbyRecreatorLoop
+        if (IS_DOING_HostLobbyRecreatorLoop) {
+            if (bIOFailure || pCallback.m_eResult != EResult.k_EResultOK)
+                return;
+            if (Net.IsServer && Net.TryGetSteamTransport(out var recoveryTransport)) {
+                UpdateLobbyInfo((CSteamID)pCallback.m_ulSteamIDLobby, ref CURRENT_LOBBY);
+                // CreateServerSocket returns true even if steam gave us an invalid socket
+                if (recoveryTransport.CreateServerSocket() && recoveryTransport.listenSocket != HSteamListenSocket.Invalid) {
+                    IS_IN_LOBBY = true;
+                    IS_DOING_HostLobbyRecreatorLoop = false;
+                    Server_UpdateLobbyData();
+                    UpdateRichPresence();
+                    Chat.LogMessage(Chat.NAMELABEL_LOCALSYSTEM, "Lobby ready.");
+                    return;
+                }
+            }
+            SteamMatchmaking.LeaveLobby((CSteamID)pCallback.m_ulSteamIDLobby); // dont leave an empty lobby behind
+            CURRENT_LOBBY.lobby_steamID = CSteamID.Nil;
+            return;
+        }
+
         if (bIOFailure) {
             ESteamAPICallFailure reason = SteamUtils.GetAPICallFailureReason(OnLobbyCreatedCallResult.Handle);
             Multiplayer.DoMultiplayerStatusMessageError("STEAM: OnLobbyCreated encountered an IOFailure due to: " + reason);
@@ -1429,7 +1491,7 @@ public class KSteam : MonoBehaviour {
         SteamMatchmaking.SetLobbyData(LobbyId, LOBBYDATAKEY_VERSION, Multiplayer.FULL_VERSION_TAG);
         SteamMatchmaking.SetLobbyData(LobbyId, "bucket", bucket.ToString());
         Util.DelayCallLambda(0.5f, () => { 
-            if (!IS_IN_LOBBY) {
+            if (!IS_IN_LOBBY || CURRENT_LOBBY.lobby_steamID.m_SteamID != pCallback.m_ulSteamIDLobby) {
                 return;
             }
             Server_UpdateLobbyData();
@@ -2592,7 +2654,16 @@ public class TransportSteamworks : NetTransportBase {
             listenSocket = HSteamListenSocket.Invalid;
         }
     }
+    internal void ShutdownForLobbyRecovery() {
+        UpdateTheIDDicts(); // so every player is in the dict before we remove them
+        foreach (ulong steamID in SteamIDToNetPlayerDict.Keys.ToArray())
+            RemoveSteamUser(steamID);
+        Shutdown(false);
+    }
+
     internal void Shutdown(bool reset_net) {
+        if (reset_net)
+            KSteam.CancelHostLobbyRecovery();
 
         CloseListenSocket();
 
